@@ -1,9 +1,11 @@
 import bpy
 import json
+from bpy.app.handlers import persistent
 
 
 # ============================================================
 # TA SKIN / DEFORMATION VALIDATOR
+# LIVE ANALYSIS VERSION
 # ============================================================
 
 
@@ -11,31 +13,36 @@ import json
 # SETTINGS
 # ============================================================
 
-# Weight validation
 MAX_INFLUENCES = 4
 TINY_RELATIVE_WEIGHT = 0.01
 RAW_SUM_TOLERANCE = 0.01
 
-# Local deformation score
 AVERAGE_WEIGHT = 0.70
 PEAK_WEIGHT = 0.30
 
-# Problem score
 PROBLEM_STRETCH_WEIGHT = 0.20
 PROBLEM_COMPRESSION_WEIGHT = 0.30
 PROBLEM_COLLAPSE_WEIGHT = 0.50
 PROBLEM_INTERACTION_WEIGHT = 0.35
 
-# Heatmap
 HEATMAP_ATTRIBUTE = "TA_Distortion"
 HEATMAP_MATERIAL = "TA_Distortion_Heatmap"
 
-# Material backup
 BACKUP_MATERIALS_PROP = "ta_original_material_names"
 BACKUP_INDICES_PROP = "ta_original_material_indices"
 
-# Region storage
 REGIONS_PROP = "ta_problem_regions"
+
+
+# ============================================================
+# LIVE CACHE
+# ============================================================
+
+# Runtime only.
+# Nothing here is permanently stored in the .blend.
+TA_LIVE_CACHE = {}
+
+TA_LIVE_UPDATING = False
 
 
 # ============================================================
@@ -56,6 +63,9 @@ def get_active_mesh():
 
 
 def get_armature(obj):
+
+    if obj is None:
+        return None
 
     for modifier in obj.modifiers:
 
@@ -90,13 +100,9 @@ def get_deform_group_indices(obj):
 
 def get_evaluated_positions(obj):
 
-    depsgraph = (
-        bpy.context.evaluated_depsgraph_get()
-    )
+    depsgraph = bpy.context.evaluated_depsgraph_get()
 
-    eval_obj = obj.evaluated_get(
-        depsgraph
-    )
+    eval_obj = obj.evaluated_get(depsgraph)
 
     eval_mesh = eval_obj.to_mesh()
 
@@ -129,10 +135,7 @@ def select_vertices(obj, indices):
     for index in indices:
 
         if 0 <= index < len(obj.data.vertices):
-
-            obj.data.vertices[
-                index
-            ].select = True
+            obj.data.vertices[index].select = True
 
     bpy.ops.object.mode_set(
         mode='EDIT'
@@ -150,9 +153,7 @@ def scan_weights(obj):
     too_many = []
     tiny = []
 
-    deform_groups = (
-        get_deform_group_indices(obj)
-    )
+    deform_groups = get_deform_group_indices(obj)
 
     if not deform_groups:
 
@@ -185,10 +186,7 @@ def scan_weights(obj):
 
         if not weights:
 
-            unweighted.append(
-                vertex.index
-            )
-
+            unweighted.append(vertex.index)
             continue
 
         total = sum(
@@ -196,10 +194,7 @@ def scan_weights(obj):
             for _, weight in weights
         )
 
-        if (
-            abs(total - 1.0)
-            > RAW_SUM_TOLERANCE
-        ):
+        if abs(total - 1.0) > RAW_SUM_TOLERANCE:
 
             raw_sum.append(
                 (
@@ -250,76 +245,6 @@ def scan_weights(obj):
 
 
 # ============================================================
-# REST / CURRENT POSE
-# ============================================================
-
-def get_rest_and_current_positions(obj):
-
-    armature = get_armature(obj)
-
-    if armature is None:
-
-        return (
-            None,
-            None,
-            "No Armature Modifier found."
-        )
-
-    original_state = (
-        armature.data.pose_position
-    )
-
-    rest = None
-    current = None
-
-    try:
-
-        armature.data.pose_position = 'REST'
-        bpy.context.view_layer.update()
-
-        rest = get_evaluated_positions(obj)
-
-        armature.data.pose_position = 'POSE'
-        bpy.context.view_layer.update()
-
-        current = get_evaluated_positions(obj)
-
-    finally:
-
-        armature.data.pose_position = (
-            original_state
-        )
-
-        bpy.context.view_layer.update()
-
-    if rest is None or current is None:
-
-        return (
-            None,
-            None,
-            "Could not evaluate mesh."
-        )
-
-    if len(rest) != len(current):
-
-        return (
-            None,
-            None,
-            "Topology changes between Rest and Pose."
-        )
-
-    if len(rest) != len(obj.data.vertices):
-
-        return (
-            None,
-            None,
-            "Evaluated topology differs from base mesh."
-        )
-
-    return rest, current, None
-
-
-# ============================================================
 # SCORE HELPERS
 # ============================================================
 
@@ -328,10 +253,7 @@ def blended_local_score(values):
     if not values:
         return 0.0
 
-    average = (
-        sum(values)
-        / len(values)
-    )
+    average = sum(values) / len(values)
 
     peak = max(values)
 
@@ -345,97 +267,10 @@ def blended_local_score(values):
 def triangle_area(a, b, c):
 
     return (
-        (b - a).cross(
-            c - a
-        ).length
+        (b - a).cross(c - a).length
         * 0.5
     )
 
-
-# ============================================================
-# SURFACE COLLAPSE
-# ============================================================
-
-def calculate_surface_collapse(
-    mesh,
-    rest_positions,
-    current_positions
-):
-
-    mesh.calc_loop_triangles()
-
-    local_values = {
-        vertex.index: []
-        for vertex in mesh.vertices
-    }
-
-    for tri in mesh.loop_triangles:
-
-        a, b, c = tri.vertices
-
-        rest_area = triangle_area(
-            rest_positions[a],
-            rest_positions[b],
-            rest_positions[c]
-        )
-
-        if rest_area <= 0.0000001:
-            continue
-
-        current_area = triangle_area(
-            current_positions[a],
-            current_positions[b],
-            current_positions[c]
-        )
-
-        ratio = (
-            current_area
-            / rest_area
-        )
-
-        collapse = max(
-            0.0,
-            1.0 - ratio
-        )
-
-        collapse = min(
-            collapse,
-            1.0
-        )
-
-        local_values[a].append(
-            collapse
-        )
-
-        local_values[b].append(
-            collapse
-        )
-
-        local_values[c].append(
-            collapse
-        )
-
-    scores = [
-        0.0
-        for _ in mesh.vertices
-    ]
-
-    for index, values in (
-        local_values.items()
-    ):
-
-        scores[index] = (
-            blended_local_score(
-                values
-            )
-        )
-
-    return scores
-
-
-# ============================================================
-# PROBLEM SCORE
-# ============================================================
 
 def calculate_problem_scores(
     stretch_scores,
@@ -452,18 +287,11 @@ def calculate_problem_scores(
     ):
 
         base = (
-            stretch
-            * PROBLEM_STRETCH_WEIGHT
-
+            stretch * PROBLEM_STRETCH_WEIGHT
             +
-
-            compression
-            * PROBLEM_COMPRESSION_WEIGHT
-
+            compression * PROBLEM_COMPRESSION_WEIGHT
             +
-
-            collapse
-            * PROBLEM_COLLAPSE_WEIGHT
+            collapse * PROBLEM_COLLAPSE_WEIGHT
         )
 
         interaction = (
@@ -482,160 +310,330 @@ def calculate_problem_scores(
 
 
 # ============================================================
-# DEFORMATION ANALYSIS
+# REST CACHE
 # ============================================================
 
-def analyze_distortion(
-    obj,
-    threshold
-):
+def build_rest_cache(obj):
 
-    (
-        rest_positions,
-        current_positions,
-        error
-    ) = get_rest_and_current_positions(
-        obj
+    armature = get_armature(obj)
+
+    if armature is None:
+
+        return (
+            None,
+            "No Armature Modifier found."
+        )
+
+    if obj.mode != 'OBJECT':
+
+        try:
+
+            bpy.ops.object.mode_set(
+                mode='OBJECT'
+            )
+
+        except Exception:
+            pass
+
+    original_pose_position = (
+        armature.data.pose_position
     )
 
-    if error:
+    try:
 
-        return {
-            "error": error
-        }
+        armature.data.pose_position = 'REST'
+
+        bpy.context.view_layer.update()
+
+        rest_positions = (
+            get_evaluated_positions(obj)
+        )
+
+    finally:
+
+        armature.data.pose_position = (
+            original_pose_position
+        )
+
+        bpy.context.view_layer.update()
 
     mesh = obj.data
 
-    neighbors = {
-        vertex.index: set()
-        for vertex in mesh.vertices
-    }
+    if len(rest_positions) != len(mesh.vertices):
+
+        return (
+            None,
+            (
+                "Evaluated topology differs from "
+                "the base mesh."
+            )
+        )
+
+    # --------------------------------------------------------
+    # Cache edges and rest lengths
+    # --------------------------------------------------------
+
+    edges = []
 
     for edge in mesh.edges:
 
         a, b = edge.vertices
 
-        neighbors[a].add(b)
-        neighbors[b].add(a)
+        rest_length = (
+            rest_positions[b]
+            -
+            rest_positions[a]
+        ).length
 
-    count = len(mesh.vertices)
+        if rest_length <= 0.000001:
+            continue
 
-    combined_scores = [0.0] * count
-    stretch_scores = [0.0] * count
-    compression_scores = [0.0] * count
-
-    # --------------------------------------------------------
-    # Edge deformation
-    # --------------------------------------------------------
-
-    for vertex in mesh.vertices:
-
-        index = vertex.index
-
-        local_combined = []
-        local_stretch = []
-        local_compression = []
-
-        for neighbor in neighbors[index]:
-
-            rest_vec = (
-                rest_positions[neighbor]
-                -
-                rest_positions[index]
-            )
-
-            current_vec = (
-                current_positions[neighbor]
-                -
-                current_positions[index]
-            )
-
-            rest_length = (
-                rest_vec.length
-            )
-
-            current_length = (
-                current_vec.length
-            )
-
-            if rest_length <= 0.000001:
-                continue
-
-            ratio = (
-                current_length
-                / rest_length
-            )
-
-            stretch = 0.0
-            compression = 0.0
-
-            if ratio > 1.0:
-
-                stretch = (
-                    ratio - 1.0
-                )
-
-            elif ratio < 1.0:
-
-                compression = (
-                    1.0
-                    /
-                    max(
-                        ratio,
-                        0.000001
-                    )
-                ) - 1.0
-
-            combined = max(
-                stretch,
-                compression
-            )
-
-            local_stretch.append(
-                stretch
-            )
-
-            local_compression.append(
-                compression
-            )
-
-            local_combined.append(
-                combined
-            )
-
-        stretch_scores[index] = (
-            blended_local_score(
-                local_stretch
-            )
-        )
-
-        compression_scores[index] = (
-            blended_local_score(
-                local_compression
-            )
-        )
-
-        combined_scores[index] = (
-            blended_local_score(
-                local_combined
+        edges.append(
+            (
+                a,
+                b,
+                rest_length
             )
         )
 
     # --------------------------------------------------------
-    # Surface collapse
+    # Cache triangles and rest areas
     # --------------------------------------------------------
 
-    collapse_scores = (
-        calculate_surface_collapse(
-            mesh,
+    mesh.calc_loop_triangles()
+
+    triangles = []
+
+    for tri in mesh.loop_triangles:
+
+        a, b, c = tri.vertices
+
+        rest_area = triangle_area(
+            rest_positions[a],
+            rest_positions[b],
+            rest_positions[c]
+        )
+
+        if rest_area <= 0.0000001:
+            continue
+
+        triangles.append(
+            (
+                a,
+                b,
+                c,
+                rest_area
+            )
+        )
+
+    cache = {
+
+        "object_name":
+            obj.name,
+
+        "vertex_count":
+            len(mesh.vertices),
+
+        "edges":
+            edges,
+
+        "triangles":
+            triangles,
+
+        "rest_positions":
             rest_positions,
-            current_positions
-        )
+
+        "last_frame":
+            None,
+    }
+
+    return cache, None
+
+
+# ============================================================
+# FAST CURRENT-POSE ANALYSIS
+# ============================================================
+
+def calculate_current_pose_scores(
+    obj,
+    cache
+):
+
+    current_positions = (
+        get_evaluated_positions(obj)
     )
 
-    # --------------------------------------------------------
-    # Problem score
-    # --------------------------------------------------------
+    vertex_count = (
+        cache["vertex_count"]
+    )
+
+    if len(current_positions) != vertex_count:
+
+        return {
+            "error":
+                (
+                    "Evaluated topology changed. "
+                    "Rebuild the Live Cache."
+                )
+        }
+
+    stretch_local = [
+        []
+        for _ in range(vertex_count)
+    ]
+
+    compression_local = [
+        []
+        for _ in range(vertex_count)
+    ]
+
+    combined_local = [
+        []
+        for _ in range(vertex_count)
+    ]
+
+    collapse_local = [
+        []
+        for _ in range(vertex_count)
+    ]
+
+    # ========================================================
+    # EDGE DEFORMATION
+    # ========================================================
+
+    for (
+        a,
+        b,
+        rest_length
+    ) in cache["edges"]:
+
+        current_length = (
+            current_positions[b]
+            -
+            current_positions[a]
+        ).length
+
+        ratio = (
+            current_length
+            /
+            rest_length
+        )
+
+        stretch = 0.0
+        compression = 0.0
+
+        if ratio > 1.0:
+
+            stretch = ratio - 1.0
+
+        elif ratio < 1.0:
+
+            compression = (
+                1.0
+                /
+                max(
+                    ratio,
+                    0.000001
+                )
+            ) - 1.0
+
+        combined = max(
+            stretch,
+            compression
+        )
+
+        stretch_local[a].append(
+            stretch
+        )
+
+        stretch_local[b].append(
+            stretch
+        )
+
+        compression_local[a].append(
+            compression
+        )
+
+        compression_local[b].append(
+            compression
+        )
+
+        combined_local[a].append(
+            combined
+        )
+
+        combined_local[b].append(
+            combined
+        )
+
+    # ========================================================
+    # SURFACE COLLAPSE
+    # ========================================================
+
+    for (
+        a,
+        b,
+        c,
+        rest_area
+    ) in cache["triangles"]:
+
+        current_area = triangle_area(
+            current_positions[a],
+            current_positions[b],
+            current_positions[c]
+        )
+
+        ratio = (
+            current_area
+            /
+            rest_area
+        )
+
+        collapse = max(
+            0.0,
+            1.0 - ratio
+        )
+
+        collapse = min(
+            collapse,
+            1.0
+        )
+
+        collapse_local[a].append(
+            collapse
+        )
+
+        collapse_local[b].append(
+            collapse
+        )
+
+        collapse_local[c].append(
+            collapse
+        )
+
+    # ========================================================
+    # BLENDED VERTEX SCORES
+    # ========================================================
+
+    stretch_scores = [
+        blended_local_score(values)
+        for values in stretch_local
+    ]
+
+    compression_scores = [
+        blended_local_score(values)
+        for values in compression_local
+    ]
+
+    combined_scores = [
+        blended_local_score(values)
+        for values in combined_local
+    ]
+
+    collapse_scores = [
+        blended_local_score(values)
+        for values in collapse_local
+    ]
 
     problem_scores = (
         calculate_problem_scores(
@@ -644,32 +642,6 @@ def analyze_distortion(
             collapse_scores
         )
     )
-
-    def high(scores):
-
-        return [
-            index
-            for index, score
-            in enumerate(scores)
-            if score >= threshold
-        ]
-
-    def safe_max(values):
-
-        return (
-            max(values)
-            if values
-            else 0.0
-        )
-
-    def safe_average(values):
-
-        return (
-            sum(values)
-            / len(values)
-            if values
-            else 0.0
-        )
 
     return {
 
@@ -689,52 +661,88 @@ def analyze_distortion(
 
         "problem_scores":
             problem_scores,
-
-        "high_combined":
-            high(combined_scores),
-
-        "high_stretch":
-            high(stretch_scores),
-
-        "high_compression":
-            high(compression_scores),
-
-        "high_collapse":
-            high(collapse_scores),
-
-        "high_problem":
-            high(problem_scores),
-
-        "max_combined":
-            safe_max(combined_scores),
-
-        "max_stretch":
-            safe_max(stretch_scores),
-
-        "max_compression":
-            safe_max(compression_scores),
-
-        "max_collapse":
-            safe_max(collapse_scores),
-
-        "max_problem":
-            safe_max(problem_scores),
-
-        "avg_combined":
-            safe_average(combined_scores),
-
-        "avg_stretch":
-            safe_average(stretch_scores),
-
-        "avg_compression":
-            safe_average(compression_scores),
-
-        "avg_collapse":
-            safe_average(collapse_scores),
-
-        "avg_problem":
-            safe_average(problem_scores),
     }
+
+
+# ============================================================
+# FULL ANALYSIS
+# ============================================================
+
+def analyze_distortion(
+    obj,
+    threshold
+):
+
+    cache, error = (
+        build_rest_cache(obj)
+    )
+
+    if error:
+
+        return {
+            "error": error
+        }
+
+    results = (
+        calculate_current_pose_scores(
+            obj,
+            cache
+        )
+    )
+
+    if results["error"]:
+        return results
+
+    def get_high(scores):
+
+        return [
+            index
+            for index, score
+            in enumerate(scores)
+            if score >= threshold
+        ]
+
+    def safe_max(values):
+
+        return (
+            max(values)
+            if values
+            else 0.0
+        )
+
+    def safe_average(values):
+
+        return (
+            sum(values) / len(values)
+            if values
+            else 0.0
+        )
+
+    for mode_name in [
+        "combined",
+        "stretch",
+        "compression",
+        "collapse",
+        "problem",
+    ]:
+
+        scores = results[
+            f"{mode_name}_scores"
+        ]
+
+        results[
+            f"high_{mode_name}"
+        ] = get_high(scores)
+
+        results[
+            f"max_{mode_name}"
+        ] = safe_max(scores)
+
+        results[
+            f"avg_{mode_name}"
+        ] = safe_average(scores)
+
+    return results
 
 
 # ============================================================
@@ -786,7 +794,7 @@ def get_mode_scores(
 
     keys = mapping.get(
         mode,
-        mapping['COMBINED']
+        mapping["COMBINED"]
     )
 
     return (
@@ -795,6 +803,37 @@ def get_mode_scores(
         results[keys[2]],
         results[keys[3]],
     )
+
+
+def get_live_mode_scores(
+    results,
+    mode
+):
+
+    mapping = {
+
+        'COMBINED':
+            "combined_scores",
+
+        'STRETCH':
+            "stretch_scores",
+
+        'COMPRESSION':
+            "compression_scores",
+
+        'SURFACE_COLLAPSE':
+            "collapse_scores",
+
+        'PROBLEM':
+            "problem_scores",
+    }
+
+    key = mapping.get(
+        mode,
+        "combined_scores"
+    )
+
+    return results[key]
 
 
 # ============================================================
@@ -824,14 +863,14 @@ def cluster_problem_regions(
     threshold
 ):
 
-    problem_vertices = set(
+    problem_vertices = {
         index
         for index, score
         in enumerate(
             results["problem_scores"]
         )
         if score >= threshold
-    )
+    }
 
     if not problem_vertices:
         return []
@@ -867,33 +906,22 @@ def cluster_problem_regions(
             for neighbor in neighbors[current]:
 
                 if (
-                    neighbor
-                    in problem_vertices
+                    neighbor in problem_vertices
                     and
-                    neighbor
-                    not in visited
+                    neighbor not in visited
                 ):
 
-                    visited.add(
-                        neighbor
-                    )
+                    visited.add(neighbor)
 
                     stack.append(
                         neighbor
                     )
 
-        if region_vertices:
+        if len(region_vertices) >= 2:
 
             regions.append(
                 region_vertices
             )
-
-    # Ignore isolated single vertices.
-    regions = [
-        region
-        for region in regions
-        if len(region) >= 2
-    ]
 
     return regions
 
@@ -936,7 +964,6 @@ def determine_primary_cause(
     collapse
 ):
 
-    # Compression + collapse together
     if (
         compression >= 0.15
         and
@@ -1087,7 +1114,6 @@ def create_region_data(
                 risk,
         })
 
-    # Most serious first
     regions.sort(
         key=lambda region:
             region["peak"],
@@ -1102,10 +1128,8 @@ def save_regions(
     regions
 ):
 
-    obj[
-        REGIONS_PROP
-    ] = json.dumps(
-        regions
+    obj[REGIONS_PROP] = (
+        json.dumps(regions)
     )
 
 
@@ -1117,14 +1141,50 @@ def load_regions(obj):
     try:
 
         return json.loads(
-            obj[
-                REGIONS_PROP
-            ]
+            obj[REGIONS_PROP]
         )
 
     except Exception:
 
         return []
+
+
+def update_region_inspector(
+    obj,
+    region
+):
+
+    obj["ta_region_vertex_count"] = (
+        region["vertex_count"]
+    )
+
+    obj["ta_region_peak"] = (
+        region["peak"]
+    )
+
+    obj["ta_region_average"] = (
+        region["average"]
+    )
+
+    obj["ta_region_stretch"] = (
+        region["stretch"]
+    )
+
+    obj["ta_region_compression"] = (
+        region["compression"]
+    )
+
+    obj["ta_region_collapse"] = (
+        region["collapse"]
+    )
+
+    obj["ta_region_risk"] = (
+        region["risk"]
+    )
+
+    obj["ta_region_cause"] = (
+        region["cause"]
+    )
 
 
 # ============================================================
@@ -1141,6 +1201,7 @@ def heatmap_color_from_score(
         0.0001
     )
 
+    # Blue -> Cyan
     if score <= threshold * 0.5:
 
         t = (
@@ -1156,6 +1217,7 @@ def heatmap_color_from_score(
             1.0
         )
 
+    # Cyan -> Yellow
     if score <= threshold:
 
         t = (
@@ -1172,11 +1234,11 @@ def heatmap_color_from_score(
             1.0
         )
 
+    # Yellow -> Orange
     if score <= threshold * 2.0:
 
         t = (
-            score
-            - threshold
+            score - threshold
         ) / threshold
 
         return (
@@ -1186,6 +1248,7 @@ def heatmap_color_from_score(
             1.0
         )
 
+    # Orange -> Red
     t = min(
         (
             score
@@ -1196,9 +1259,7 @@ def heatmap_color_from_score(
 
     return (
         1.0,
-        0.5 * (
-            1.0 - t
-        ),
+        0.5 * (1.0 - t),
         0.0,
         1.0
     )
@@ -1280,128 +1341,7 @@ def get_or_create_heatmap_material():
     return material
 
 
-# ============================================================
-# MATERIAL BACKUP
-# ============================================================
-
-def backup_original_materials(obj):
-
-    if BACKUP_MATERIALS_PROP in obj:
-        return
-
-    names = []
-
-    for material in obj.data.materials:
-
-        if material is None:
-            names.append("")
-        else:
-            names.append(
-                material.name
-            )
-
-    indices = [
-        polygon.material_index
-        for polygon in obj.data.polygons
-    ]
-
-    obj[
-        BACKUP_MATERIALS_PROP
-    ] = json.dumps(
-        names
-    )
-
-    obj[
-        BACKUP_INDICES_PROP
-    ] = json.dumps(
-        indices
-    )
-
-
-def restore_original_materials(obj):
-
-    if (
-        BACKUP_MATERIALS_PROP
-        not in obj
-    ):
-
-        return False
-
-    try:
-
-        names = json.loads(
-            obj[
-                BACKUP_MATERIALS_PROP
-            ]
-        )
-
-        indices = json.loads(
-            obj[
-                BACKUP_INDICES_PROP
-            ]
-        )
-
-    except Exception:
-
-        return False
-
-    mesh = obj.data
-
-    mesh.materials.clear()
-
-    for name in names:
-
-        if not name:
-            continue
-
-        material = (
-            bpy.data.materials.get(
-                name
-            )
-        )
-
-        if material is not None:
-
-            mesh.materials.append(
-                material
-            )
-
-    for index, polygon in enumerate(
-        mesh.polygons
-    ):
-
-        if index >= len(indices):
-            continue
-
-        if len(mesh.materials) == 0:
-
-            polygon.material_index = 0
-
-        else:
-
-            polygon.material_index = min(
-                indices[index],
-                len(mesh.materials) - 1
-            )
-
-    del obj[
-        BACKUP_MATERIALS_PROP
-    ]
-
-    del obj[
-        BACKUP_INDICES_PROP
-    ]
-
-    return True
-
-
-def create_heatmap(
-    obj,
-    scores,
-    threshold
-):
-
-    mesh = obj.data
+def ensure_heatmap_attribute(mesh):
 
     color_attribute = (
         mesh.color_attributes.get(
@@ -1434,26 +1374,52 @@ def create_heatmap(
             )
         )
 
-    for index, score in enumerate(
-        scores
-    ):
-
-        color_attribute.data[
-            index
-        ].color = (
-            heatmap_color_from_score(
-                score,
-                threshold
-            )
-        )
-
     mesh.color_attributes.active_color = (
         color_attribute
     )
 
-    backup_original_materials(
-        obj
+    return color_attribute
+
+
+# ============================================================
+# MATERIAL BACKUP
+# ============================================================
+
+def backup_original_materials(obj):
+
+    if BACKUP_MATERIALS_PROP in obj:
+        return
+
+    names = []
+
+    for material in obj.data.materials:
+
+        if material is None:
+            names.append("")
+        else:
+            names.append(
+                material.name
+            )
+
+    indices = [
+        polygon.material_index
+        for polygon in obj.data.polygons
+    ]
+
+    obj[BACKUP_MATERIALS_PROP] = (
+        json.dumps(names)
     )
+
+    obj[BACKUP_INDICES_PROP] = (
+        json.dumps(indices)
+    )
+
+
+def assign_heatmap_material(obj):
+
+    mesh = obj.data
+
+    backup_original_materials(obj)
 
     material = (
         get_or_create_heatmap_material()
@@ -1468,7 +1434,6 @@ def create_heatmap(
         if existing == material:
 
             material_index = index
-
             break
 
     if material_index is None:
@@ -1478,8 +1443,7 @@ def create_heatmap(
         )
 
         material_index = (
-            len(mesh.materials)
-            - 1
+            len(mesh.materials) - 1
         )
 
     for polygon in mesh.polygons:
@@ -1487,6 +1451,336 @@ def create_heatmap(
         polygon.material_index = (
             material_index
         )
+
+
+def restore_original_materials(obj):
+
+    if BACKUP_MATERIALS_PROP not in obj:
+        return False
+
+    try:
+
+        names = json.loads(
+            obj[BACKUP_MATERIALS_PROP]
+        )
+
+        indices = json.loads(
+            obj[BACKUP_INDICES_PROP]
+        )
+
+    except Exception:
+
+        return False
+
+    mesh = obj.data
+
+    mesh.materials.clear()
+
+    for name in names:
+
+        if not name:
+            continue
+
+        material = (
+            bpy.data.materials.get(name)
+        )
+
+        if material is not None:
+
+            mesh.materials.append(
+                material
+            )
+
+    for index, polygon in enumerate(
+        mesh.polygons
+    ):
+
+        if index >= len(indices):
+            continue
+
+        if len(mesh.materials) == 0:
+
+            polygon.material_index = 0
+
+        else:
+
+            polygon.material_index = min(
+                indices[index],
+                len(mesh.materials) - 1
+            )
+
+    del obj[BACKUP_MATERIALS_PROP]
+    del obj[BACKUP_INDICES_PROP]
+
+    return True
+
+
+def update_heatmap_colors(
+    obj,
+    scores,
+    threshold,
+    assign_material=False
+):
+
+    mesh = obj.data
+
+    attribute = (
+        ensure_heatmap_attribute(mesh)
+    )
+
+    if len(attribute.data) != len(scores):
+
+        return False
+
+    for index, score in enumerate(scores):
+
+        attribute.data[index].color = (
+            heatmap_color_from_score(
+                score,
+                threshold
+            )
+        )
+
+    if assign_material:
+        assign_heatmap_material(obj)
+
+    mesh.update()
+
+    return True
+
+
+def create_heatmap(
+    obj,
+    scores,
+    threshold
+):
+
+    return update_heatmap_colors(
+        obj,
+        scores,
+        threshold,
+        assign_material=True
+    )
+
+
+# ============================================================
+# LIVE ANALYSIS
+# ============================================================
+
+def live_cache_key(obj):
+
+    return obj.name_full
+
+
+def rebuild_live_cache(obj):
+
+    key = live_cache_key(obj)
+
+    cache, error = (
+        build_rest_cache(obj)
+    )
+
+    if error:
+
+        return None, error
+
+    TA_LIVE_CACHE[key] = cache
+
+    return cache, None
+
+
+def get_live_object(scene):
+
+    object_name = (
+        scene.ta_live_object_name
+    )
+
+    if not object_name:
+        return None
+
+    obj = bpy.data.objects.get(
+        object_name
+    )
+
+    if obj is None:
+        return None
+
+    if obj.type != 'MESH':
+        return None
+
+    return obj
+
+
+def update_live_analysis(
+    scene,
+    force=False
+):
+
+    global TA_LIVE_UPDATING
+
+    if TA_LIVE_UPDATING:
+        return
+
+    if not scene.ta_live_analysis:
+        return
+
+    obj = get_live_object(scene)
+
+    if obj is None:
+
+        scene.ta_live_analysis = False
+
+        print(
+            "TA Live Analysis stopped: "
+            "mesh object not found."
+        )
+
+        return
+
+    interval = max(
+        1,
+        scene.ta_live_update_interval
+    )
+
+    key = live_cache_key(obj)
+
+    cache = TA_LIVE_CACHE.get(key)
+
+    if cache is None:
+
+        cache, error = (
+            rebuild_live_cache(obj)
+        )
+
+        if error:
+
+            scene.ta_live_analysis = False
+
+            print(
+                "TA Live Analysis error:",
+                error
+            )
+
+            return
+
+    current_frame = (
+        scene.frame_current
+    )
+
+    last_frame = (
+        cache.get("last_frame")
+    )
+
+    if (
+        not force
+        and
+        last_frame is not None
+        and
+        abs(
+            current_frame
+            -
+            last_frame
+        ) < interval
+    ):
+        return
+
+    TA_LIVE_UPDATING = True
+
+    try:
+
+        results = (
+            calculate_current_pose_scores(
+                obj,
+                cache
+            )
+        )
+
+        if results["error"]:
+
+            scene.ta_live_analysis = False
+
+            print(
+                "TA Live Analysis error:",
+                results["error"]
+            )
+
+            return
+
+        mode = (
+            scene.ta_analysis_mode
+        )
+
+        threshold = (
+            scene.ta_distortion_threshold
+        )
+
+        scores = (
+            get_live_mode_scores(
+                results,
+                mode
+            )
+        )
+
+        update_heatmap_colors(
+            obj,
+            scores,
+            threshold,
+            assign_material=True
+        )
+
+        high_count = sum(
+            1
+            for score in scores
+            if score >= threshold
+        )
+
+        max_score = (
+            max(scores)
+            if scores
+            else 0.0
+        )
+
+        average_score = (
+            sum(scores) / len(scores)
+            if scores
+            else 0.0
+        )
+
+        obj[
+            "ta_high_distortion_count"
+        ] = high_count
+
+        obj[
+            "ta_max_distortion"
+        ] = max_score
+
+        obj[
+            "ta_average_distortion"
+        ] = average_score
+
+        obj[
+            "ta_last_analysis_mode"
+        ] = mode
+
+        cache["last_frame"] = (
+            current_frame
+        )
+
+    finally:
+
+        TA_LIVE_UPDATING = False
+
+
+@persistent
+def ta_live_frame_handler(
+    scene,
+    depsgraph=None
+):
+
+    update_live_analysis(
+        scene,
+        force=False
+    )
 
 
 # ============================================================
@@ -1525,27 +1819,19 @@ class TA_OT_ScanWeights(
             return {'CANCELLED'}
 
         obj["ta_unweighted_count"] = (
-            len(
-                results["unweighted"]
-            )
+            len(results["unweighted"])
         )
 
         obj["ta_toomany_count"] = (
-            len(
-                results["too_many"]
-            )
+            len(results["too_many"])
         )
 
         obj["ta_tiny_count"] = (
-            len(
-                results["tiny"]
-            )
+            len(results["tiny"])
         )
 
         obj["ta_rawsum_count"] = (
-            len(
-                results["raw_sum"]
-            )
+            len(results["raw_sum"])
         )
 
         self.report(
@@ -1638,7 +1924,7 @@ class TA_OT_SelectTiny(
 
 
 # ============================================================
-# DEFORMATION OPERATORS
+# STANDARD ANALYSIS OPERATORS
 # ============================================================
 
 class TA_OT_AnalyzePose(
@@ -1699,9 +1985,7 @@ class TA_OT_AnalyzePose(
 
         obj[
             "ta_high_distortion_count"
-        ] = len(
-            high_vertices
-        )
+        ] = len(high_vertices)
 
         obj[
             "ta_max_distortion"
@@ -1714,14 +1998,6 @@ class TA_OT_AnalyzePose(
         obj[
             "ta_last_analysis_mode"
         ] = mode
-
-        self.report(
-            {'INFO'},
-            (
-                f"{mode}: "
-                f"{len(high_vertices)} warnings"
-            )
-        )
 
         return {'FINISHED'}
 
@@ -1745,19 +2021,10 @@ class TA_OT_SelectHigh(
         if obj is None:
             return {'CANCELLED'}
 
-        threshold = (
-            context.scene
-            .ta_distortion_threshold
-        )
-
-        mode = (
-            context.scene
-            .ta_analysis_mode
-        )
-
         results = analyze_distortion(
             obj,
-            threshold
+            context.scene
+            .ta_distortion_threshold
         )
 
         if results["error"]:
@@ -1770,7 +2037,7 @@ class TA_OT_SelectHigh(
             _
         ) = get_mode_scores(
             results,
-            mode
+            context.scene.ta_analysis_mode
         )
 
         select_vertices(
@@ -1800,17 +2067,18 @@ class TA_OT_Heatmap(
             .ta_distortion_threshold
         )
 
-        mode = (
-            context.scene
-            .ta_analysis_mode
-        )
-
         results = analyze_distortion(
             obj,
             threshold
         )
 
         if results["error"]:
+
+            self.report(
+                {'ERROR'},
+                results["error"]
+            )
+
             return {'CANCELLED'}
 
         (
@@ -1820,7 +2088,7 @@ class TA_OT_Heatmap(
             avg_score
         ) = get_mode_scores(
             results,
-            mode
+            context.scene.ta_analysis_mode
         )
 
         create_heatmap(
@@ -1831,9 +2099,7 @@ class TA_OT_Heatmap(
 
         obj[
             "ta_high_distortion_count"
-        ] = len(
-            high_vertices
-        )
+        ] = len(high_vertices)
 
         obj[
             "ta_max_distortion"
@@ -1845,7 +2111,7 @@ class TA_OT_Heatmap(
 
         obj[
             "ta_last_analysis_mode"
-        ] = mode
+        ] = context.scene.ta_analysis_mode
 
         return {'FINISHED'}
 
@@ -1859,7 +2125,15 @@ class TA_OT_Restore(
 
     def execute(self, context):
 
+        context.scene.ta_live_analysis = False
+
         obj = get_active_mesh()
+
+        if obj is None:
+
+            obj = get_live_object(
+                context.scene
+            )
 
         if obj is None:
             return {'CANCELLED'}
@@ -1879,6 +2153,193 @@ class TA_OT_Restore(
 
 
 # ============================================================
+# LIVE OPERATORS
+# ============================================================
+
+class TA_OT_StartLiveAnalysis(
+    bpy.types.Operator
+):
+
+    bl_idname = (
+        "ta.start_live_analysis"
+    )
+
+    bl_label = (
+        "Start Live Analysis"
+    )
+
+    def execute(self, context):
+
+        obj = get_active_mesh()
+
+        if obj is None:
+
+            self.report(
+                {'ERROR'},
+                "Select the skinned mesh first."
+            )
+
+            return {'CANCELLED'}
+
+        cache, error = (
+            rebuild_live_cache(obj)
+        )
+
+        if error:
+
+            self.report(
+                {'ERROR'},
+                error
+            )
+
+            return {'CANCELLED'}
+
+        context.scene.ta_live_object_name = (
+            obj.name
+        )
+
+        context.scene.ta_live_analysis = (
+            True
+        )
+
+        update_live_analysis(
+            context.scene,
+            force=True
+        )
+
+        self.report(
+            {'INFO'},
+            (
+                "Live deformation analysis "
+                "started."
+            )
+        )
+
+        return {'FINISHED'}
+
+
+class TA_OT_StopLiveAnalysis(
+    bpy.types.Operator
+):
+
+    bl_idname = (
+        "ta.stop_live_analysis"
+    )
+
+    bl_label = (
+        "Stop Live Analysis"
+    )
+
+    def execute(self, context):
+
+        context.scene.ta_live_analysis = (
+            False
+        )
+
+        self.report(
+            {'INFO'},
+            "Live analysis stopped."
+        )
+
+        return {'FINISHED'}
+
+
+class TA_OT_RebuildLiveCache(
+    bpy.types.Operator
+):
+
+    bl_idname = (
+        "ta.rebuild_live_cache"
+    )
+
+    bl_label = (
+        "Rebuild Live Cache"
+    )
+
+    def execute(self, context):
+
+        obj = get_live_object(
+            context.scene
+        )
+
+        if obj is None:
+
+            obj = get_active_mesh()
+
+        if obj is None:
+
+            self.report(
+                {'ERROR'},
+                "No mesh selected."
+            )
+
+            return {'CANCELLED'}
+
+        cache, error = (
+            rebuild_live_cache(obj)
+        )
+
+        if error:
+
+            self.report(
+                {'ERROR'},
+                error
+            )
+
+            return {'CANCELLED'}
+
+        context.scene.ta_live_object_name = (
+            obj.name
+        )
+
+        if (
+            context.scene
+            .ta_live_analysis
+        ):
+
+            update_live_analysis(
+                context.scene,
+                force=True
+            )
+
+        self.report(
+            {'INFO'},
+            "Live cache rebuilt."
+        )
+
+        return {'FINISHED'}
+
+
+class TA_OT_UpdateLiveNow(
+    bpy.types.Operator
+):
+
+    bl_idname = "ta.update_live_now"
+    bl_label = "Refresh Live Heatmap"
+
+    def execute(self, context):
+
+        if not (
+            context.scene
+            .ta_live_analysis
+        ):
+
+            self.report(
+                {'WARNING'},
+                "Live Analysis is not running."
+            )
+
+            return {'CANCELLED'}
+
+        update_live_analysis(
+            context.scene,
+            force=True
+        )
+
+        return {'FINISHED'}
+
+
+# ============================================================
 # REGION OPERATORS
 # ============================================================
 
@@ -1886,12 +2347,23 @@ class TA_OT_FindRegions(
     bpy.types.Operator
 ):
 
-    bl_idname = "ta.find_problem_regions"
-    bl_label = "Find Problem Regions"
+    bl_idname = (
+        "ta.find_problem_regions"
+    )
+
+    bl_label = (
+        "Find Problem Regions"
+    )
 
     def execute(self, context):
 
         obj = get_active_mesh()
+
+        if obj is None:
+
+            obj = get_live_object(
+                context.scene
+            )
 
         if obj is None:
             return {'CANCELLED'}
@@ -1942,8 +2414,7 @@ class TA_OT_FindRegions(
         self.report(
             {'INFO'},
             (
-                f"Found "
-                f"{len(regions)} "
+                f"Found {len(regions)} "
                 "problem regions."
             )
         )
@@ -1951,75 +2422,48 @@ class TA_OT_FindRegions(
         return {'FINISHED'}
 
 
-def update_region_inspector(
-    obj,
-    region
-):
-
-    obj["ta_region_vertex_count"] = (
-        region["vertex_count"]
-    )
-
-    obj["ta_region_peak"] = (
-        region["peak"]
-    )
-
-    obj["ta_region_average"] = (
-        region["average"]
-    )
-
-    obj["ta_region_stretch"] = (
-        region["stretch"]
-    )
-
-    obj["ta_region_compression"] = (
-        region["compression"]
-    )
-
-    obj["ta_region_collapse"] = (
-        region["collapse"]
-    )
-
-    obj["ta_region_risk"] = (
-        region["risk"]
-    )
-
-    obj["ta_region_cause"] = (
-        region["cause"]
-    )
-
-
 class TA_OT_SelectRegion(
     bpy.types.Operator
 ):
 
-    bl_idname = "ta.select_problem_region"
-    bl_label = "Select Region"
+    bl_idname = (
+        "ta.select_problem_region"
+    )
+
+    bl_label = (
+        "Select Region"
+    )
 
     def execute(self, context):
 
         obj = get_active_mesh()
 
         if obj is None:
+
+            obj = get_live_object(
+                context.scene
+            )
+
+        if obj is None:
             return {'CANCELLED'}
 
-        regions = load_regions(
-            obj
-        )
+        regions = load_regions(obj)
 
         if not regions:
 
             self.report(
                 {'WARNING'},
-                "Run Find Problem Regions first."
+                (
+                    "Run Find Problem "
+                    "Regions first."
+                )
             )
 
             return {'CANCELLED'}
 
         index = (
             context.scene
-            .ta_region_index
-            - 1
+            .ta_region_index - 1
         )
 
         index = max(
@@ -2066,6 +2510,12 @@ class TA_PT_MainPanel(
 
         obj = get_active_mesh()
 
+        if obj is None:
+
+            obj = get_live_object(
+                context.scene
+            )
+
         # ====================================================
         # WEIGHT VALIDATION
         # ====================================================
@@ -2097,8 +2547,7 @@ class TA_PT_MainPanel(
         if (
             obj is not None
             and
-            "ta_unweighted_count"
-            in obj
+            "ta_unweighted_count" in obj
         ):
 
             box.separator()
@@ -2132,7 +2581,7 @@ class TA_PT_MainPanel(
             )
 
         # ====================================================
-        # DEFORMATION
+        # DEFORMATION ANALYSIS
         # ====================================================
 
         box = layout.box()
@@ -2180,8 +2629,7 @@ class TA_PT_MainPanel(
         if (
             obj is not None
             and
-            "ta_high_distortion_count"
-            in obj
+            "ta_high_distortion_count" in obj
         ):
 
             box.separator()
@@ -2215,6 +2663,82 @@ class TA_PT_MainPanel(
             )
 
         # ====================================================
+        # LIVE ANALYSIS
+        # ====================================================
+
+        box = layout.box()
+
+        box.label(
+            text="Live Deformation Analysis",
+            icon='PLAY'
+        )
+
+        if (
+            context.scene
+            .ta_live_analysis
+        ):
+
+            box.label(
+                text="LIVE",
+                icon='REC'
+            )
+
+            if (
+                context.scene
+                .ta_live_object_name
+            ):
+
+                box.label(
+                    text=(
+                        "Mesh: "
+                        +
+                        context.scene
+                        .ta_live_object_name
+                    )
+                )
+
+            box.operator(
+                "ta.stop_live_analysis",
+                icon='PAUSE'
+            )
+
+            box.operator(
+                "ta.update_live_now",
+                icon='FILE_REFRESH'
+            )
+
+        else:
+
+            box.operator(
+                "ta.start_live_analysis",
+                icon='PLAY'
+            )
+
+        box.prop(
+            context.scene,
+            "ta_live_update_interval",
+            text="Update Every"
+        )
+
+        box.label(
+            text="frame(s)"
+        )
+
+        box.operator(
+            "ta.rebuild_live_cache",
+            icon='FILE_REFRESH'
+        )
+
+        box.separator()
+
+        box.label(
+            text=(
+                "Play the Timeline to watch "
+                "the heatmap update."
+            )
+        )
+
+        # ====================================================
         # PROBLEM REGIONS
         # ====================================================
 
@@ -2240,9 +2764,7 @@ class TA_PT_MainPanel(
         ):
 
             region_count = (
-                obj[
-                    "ta_region_count"
-                ]
+                obj["ta_region_count"]
             )
 
             box.prop(
@@ -2253,7 +2775,7 @@ class TA_PT_MainPanel(
 
             box.label(
                 text=(
-                    f"Regions Found: "
+                    "Regions Found: "
                     f"{region_count}"
                 )
             )
@@ -2352,11 +2874,38 @@ classes = (
     TA_OT_Heatmap,
     TA_OT_Restore,
 
+    TA_OT_StartLiveAnalysis,
+    TA_OT_StopLiveAnalysis,
+    TA_OT_RebuildLiveCache,
+    TA_OT_UpdateLiveNow,
+
     TA_OT_FindRegions,
     TA_OT_SelectRegion,
 
     TA_PT_MainPanel,
 )
+
+
+def remove_existing_handlers():
+
+    handlers = (
+        bpy.app.handlers
+        .frame_change_post
+    )
+
+    for handler in list(handlers):
+
+        if (
+            getattr(
+                handler,
+                "__name__",
+                ""
+            )
+            ==
+            "ta_live_frame_handler"
+        ):
+
+            handlers.remove(handler)
 
 
 def remove_old_class(cls):
@@ -2370,31 +2919,38 @@ def remove_old_class(cls):
     if old is not None:
 
         try:
+
             bpy.utils.unregister_class(
                 old
             )
+
         except Exception:
             pass
 
 
 def register():
 
-    # --------------------------------------------------------
-    # Clean old classes
-    # --------------------------------------------------------
+    global TA_LIVE_CACHE
+
+    TA_LIVE_CACHE.clear()
+
+    remove_existing_handlers()
 
     for cls in classes:
         remove_old_class(cls)
 
-    # --------------------------------------------------------
-    # Clean old properties
-    # --------------------------------------------------------
+    property_names = [
 
-    for property_name in [
         "ta_distortion_threshold",
         "ta_analysis_mode",
         "ta_region_index",
-    ]:
+
+        "ta_live_analysis",
+        "ta_live_update_interval",
+        "ta_live_object_name",
+    ]
+
+    for property_name in property_names:
 
         if hasattr(
             bpy.types.Scene,
@@ -2407,7 +2963,7 @@ def register():
             )
 
     # --------------------------------------------------------
-    # Distortion Threshold
+    # Threshold
     # --------------------------------------------------------
 
     bpy.types.Scene.ta_distortion_threshold = (
@@ -2422,7 +2978,7 @@ def register():
 
             default=0.20,
 
-            min=0.05,
+            min=0.01,
 
             max=1.50,
 
@@ -2433,7 +2989,7 @@ def register():
     )
 
     # --------------------------------------------------------
-    # Analysis Mode
+    # Analysis mode
     # --------------------------------------------------------
 
     bpy.types.Scene.ta_analysis_mode = (
@@ -2446,33 +3002,45 @@ def register():
                 (
                     'COMBINED',
                     'Combined',
-                    'Stretch and compression'
+                    (
+                        "Stretch and "
+                        "compression"
+                    )
                 ),
 
                 (
                     'STRETCH',
                     'Stretch',
-                    'Local edge stretching'
+                    (
+                        "Local edge "
+                        "stretching"
+                    )
                 ),
 
                 (
                     'COMPRESSION',
                     'Compression',
-                    'Local edge compression'
+                    (
+                        "Local edge "
+                        "compression"
+                    )
                 ),
 
                 (
                     'SURFACE_COLLAPSE',
                     'Surface Collapse',
-                    'Surface area loss'
+                    (
+                        "Triangle surface "
+                        "area loss"
+                    )
                 ),
 
                 (
                     'PROBLEM',
                     'Problem Areas',
                     (
-                        'Combined diagnostic '
-                        'problem score'
+                        "Combined diagnostic "
+                        "problem score"
                     )
                 ),
             ],
@@ -2482,7 +3050,7 @@ def register():
     )
 
     # --------------------------------------------------------
-    # Region selector
+    # Problem Region
     # --------------------------------------------------------
 
     bpy.types.Scene.ta_region_index = (
@@ -2497,7 +3065,46 @@ def register():
     )
 
     # --------------------------------------------------------
-    # Register
+    # Live
+    # --------------------------------------------------------
+
+    bpy.types.Scene.ta_live_analysis = (
+        bpy.props.BoolProperty(
+
+            name="Live Analysis",
+
+            default=False
+        )
+    )
+
+    bpy.types.Scene.ta_live_update_interval = (
+        bpy.props.IntProperty(
+
+            name="Live Update Interval",
+
+            description=(
+                "Update heatmap every N frames"
+            ),
+
+            default=2,
+
+            min=1,
+
+            max=10
+        )
+    )
+
+    bpy.types.Scene.ta_live_object_name = (
+        bpy.props.StringProperty(
+
+            name="Live Mesh",
+
+            default=""
+        )
+    )
+
+    # --------------------------------------------------------
+    # Classes
     # --------------------------------------------------------
 
     for cls in classes:
@@ -2506,14 +3113,23 @@ def register():
             cls
         )
 
+    # --------------------------------------------------------
+    # Handler
+    # --------------------------------------------------------
+
+    bpy.app.handlers.frame_change_post.append(
+        ta_live_frame_handler
+    )
+
 
 def unregister():
 
-    for cls in reversed(
-        classes
-    ):
+    remove_existing_handlers()
+
+    for cls in reversed(classes):
 
         try:
+
             bpy.utils.unregister_class(
                 cls
             )
@@ -2521,11 +3137,18 @@ def unregister():
         except Exception:
             pass
 
-    for property_name in [
+    property_names = [
+
         "ta_distortion_threshold",
         "ta_analysis_mode",
         "ta_region_index",
-    ]:
+
+        "ta_live_analysis",
+        "ta_live_update_interval",
+        "ta_live_object_name",
+    ]
+
+    for property_name in property_names:
 
         if hasattr(
             bpy.types.Scene,
