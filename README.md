@@ -197,6 +197,28 @@ The original materials can be restored from the TA Tools panel after inspection.
 
 ---
 
+## Example: Deformation Debugging
+
+The deformation analysis was used to investigate a visible skinning issue around the wrist during an extreme pose.
+
+The initial analysis highlighted concentrated deformation around the wrist joint, corresponding to a visible sharp fold in the mesh.
+
+After inspecting the affected area, I manually adjusted the skin weights and ran the deformation analysis again on the pose.
+
+| Before | After |
+| --- | --- |
+| ![Before Fix](screenshots/wrist_before.png) | ![After Fix](screenshots/wrist_after.png) |
+
+After the weight adjustment, the sharp deformation was reduced and the transition between the hand and forearm became smoother.
+
+This demonstrates the intended iteration workflow:
+
+**Analyse → Identify → Manually Adjust → Re-analyse**
+
+The validator does not automatically modify skin weights. It provides diagnostic feedback to help locate potential deformation problems and evaluate manual corrections.
+
+---
+
 ## Installation
 
 This project is currently distributed as a Blender Python script.
